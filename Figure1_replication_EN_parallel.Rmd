@@ -1,0 +1,408 @@
+---
+title: "Replication of Mian, Sufi and Verner (2017), Figure I"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+---
+
+## 1. Configuration
+
+```{r setup}
+library(dplyr)
+
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = TRUE,
+                      fig.width = 12, fig.height = 4.2, dpi = 150)
+
+# Accepts either the replication ZIP or the extracted VAR3_levels_fixedeffects_IVprctiles.csv.
+input_file <- "/Users/boxiaowang/MSV_ReplicationKit_20170307/Matlab/VAR3_levels_fixedeffects_IVprctiles.csv"
+
+# The paper uses 2,000 draws in both stages; smaller values are only for testing.
+n_boot_bias <- 2000L
+n_boot_ci   <- 2000L
+
+workers <- 10L
+
+# Iteration settings from the Matlab program.
+bias_tol  <- 0.0015
+bias_step <- 0.5
+max_bias_iterations <- 50L
+
+# One BLAS thread per worker prevents CPU oversubscription.
+Sys.setenv(OMP_NUM_THREADS = 1,
+           OPENBLAS_NUM_THREADS = 1,
+           MKL_NUM_THREADS = 1,
+           VECLIB_MAXIMUM_THREADS = 1)
+
+# L'Ecuyer-CMRG gives workers reproducible independent streams; Matlab uses a different stream.
+RNGkind("L'Ecuyer-CMRG")
+set.seed(1)
+
+```
+
+## 2. Helper functions
+
+```{r functions}
+# Within-demeaning is equivalent to country fixed effects and faster in repeated regressions.
+within_demean <- function(M, group, n_group) {
+  group_sum <- M |>
+    rowsum(group, reorder = FALSE)
+  group_n <- group |>
+    tabulate(nbins = n_group)
+  group_mean <- group_sum |>
+    sweep(1, group_n, "/")
+  M - group_mean[group, , drop = FALSE]
+}
+
+multi_ols <- function(X, Y) {
+  qx <- X |>
+    qr(tol = 1e-10)
+  if (qx$rank < ncol(X)) stop("The regression matrix is rank deficient.")
+  qx |>
+    qr.coef(Y)
+}
+
+fit_fe_var <- function(Y, X_lag, group, n_group) {
+  X_dm <- X_lag |>
+    within_demean(group, n_group)
+  Y_dm <- Y |>
+    within_demean(group, n_group)
+  beta <- X_dm |>
+    multi_ols(Y_dm)
+
+  unexplained <- Y - X_lag %*% beta
+  group_n <- group |>
+    tabulate(nbins = n_group)
+  alpha <- unexplained |>
+    rowsum(group, reorder = FALSE) |>
+    sweep(1, group_n, "/")
+  residuals <- unexplained - alpha[group, , drop = FALSE]
+
+  list(beta = beta, alpha = alpha, residuals = residuals)
+}
+
+# Actual initial lags are retained to match the authors' conditional bootstrap.
+simulate_panel <- function(beta, innovations, X_initial, group,
+                           group_sizes, p, alpha = NULL) {
+  T_obs <- nrow(X_initial)
+  n_y   <- ncol(beta)
+  X_b   <- matrix(0, T_obs, n_y * p)
+  Y_b   <- matrix(0, T_obs, n_y)
+  starts <- cumsum(c(1L, head(group_sizes, -1L)))
+
+  for (i in seq_along(group_sizes)) {
+    idx <- starts[i] + seq_len(group_sizes[i]) - 1L
+    X_b[idx[1], ] <- X_initial[idx[1], ]
+
+    for (k in seq_along(idx)) {
+      r <- idx[k]
+      fixed_effect <- if (is.null(alpha)) 0 else alpha[i, ]
+      Y_b[r, ] <- drop(X_b[r, ] %*% beta) + fixed_effect + innovations[r, ]
+
+      if (k < length(idx)) {
+        X_b[idx[k + 1L], ] <- c(Y_b[r, ],
+                                X_b[r, seq_len(n_y * (p - 1L))])
+      }
+    }
+  }
+
+  list(Y = Y_b, X = X_b)
+}
+
+cholesky_irf <- function(beta, Sigma, p, horizon = 10L) {
+  n_y <- ncol(beta)
+
+  # Data order: (household debt, firm debt, GDP); identification order: (GDP, firm debt, household debt).
+  P <- rbind(c(0, 0, 1),
+             c(0, 1, 0),
+             c(1, 0, 0))
+  impact <- t(P) %*% t(chol(P %*% Sigma %*% t(P))) %*% P
+
+  # The paper normalizes each shock to a one-unit impact response of its own variable.
+  impact <- sweep(impact, 2, diag(impact), "/")
+
+  companion <- matrix(0, n_y * p, n_y * p)
+  companion[seq_len(n_y), ] <- t(beta[seq_len(n_y * p), , drop = FALSE])
+  if (p > 1L) {
+    companion[(n_y + 1L):(n_y * p),
+              seq_len(n_y * (p - 1L))] <- diag(n_y * (p - 1L))
+  }
+
+  irf <- array(0, dim = c(horizon + 1L, n_y, n_y))
+  transition <- diag(n_y * p)
+  for (h in 0:horizon) {
+    if (h > 0L) transition <- companion %*% transition
+    irf[h + 1L, , ] <- transition[seq_len(n_y), seq_len(n_y)] %*% impact
+  }
+  irf
+}
+
+estimate_bias_corrected_beta <- function(Y, X_lag, fit_ols, group,
+                                         group_sizes, p, n_boot,
+                                         tol, update_step, max_iter,
+                                         workers) {
+  n_y <- ncol(Y)
+  T_obs <- nrow(Y)
+  n_group <- length(group_sizes)
+
+  # Matches Matlab's detrend(res,'constant').
+  centered_res <- fit_ols$residuals |>
+    scale(center = TRUE, scale = FALSE)
+  beta_trial <- fit_ols$beta
+
+  for (iteration in seq_len(max_iter)) {
+    message(sprintf("Bias-correction iteration %d: launching %d draws on %d workers ...",
+                    iteration, n_boot, workers))
+
+    beta_list <- seq_len(n_boot) |>
+      parallel::mclapply(FUN = function(b) {
+      # Observation-level signs reproduce the first-stage wild bootstrap.
+      signs <- sample(c(-1, 1), T_obs, replace = TRUE)
+      innovations_b <- centered_res * signs
+
+      sim <- beta_trial |>
+        simulate_panel(innovations_b, X_lag, group,
+                       group_sizes, p, alpha = NULL)
+      sim$Y |>
+        fit_fe_var(sim$X, group, n_group) |>
+        getElement("beta")
+    }, mc.cores = workers, mc.preschedule = TRUE, mc.set.seed = TRUE)
+
+    beta_draws <- beta_list |>
+      unlist(use.names = FALSE) |>
+      array(dim = c(n_y * p, n_y, n_boot))
+    mean_beta_b <- beta_draws |>
+      apply(c(1, 2), mean)
+    difference  <- fit_ols$beta - mean_beta_b
+    convergence <- (difference^2) |>
+      mean() |>
+      sqrt()
+    message(sprintf("Bias-correction iteration %d: RMSE = %.6f",
+                    iteration, convergence))
+
+    if (convergence <= tol) break
+    beta_trial <- beta_trial + update_step * difference
+  }
+
+  if (convergence > tol) {
+    warning("Bias correction did not converge; consider increasing n_boot_bias.")
+  }
+
+  list(beta = beta_trial,
+       bias = fit_ols$beta - beta_trial,
+       convergence = convergence,
+       iterations = iteration,
+       n_boot = n_boot)
+}
+
+bootstrap_irf_ci <- function(Y, X_lag, year, group, group_sizes, p,
+                             beta_bc, alpha_bc, residuals_bc,
+                             estimated_bias, n_boot, horizon,
+                             df_residual, workers) {
+  n_y <- ncol(Y)
+  T_obs <- nrow(Y)
+  n_group <- length(group_sizes)
+  all_years <- seq(min(year), max(year))
+
+  # Matches the finite-sample residual scaling in the Matlab program.
+  res_for_boot <- (residuals_bc * sqrt(T_obs / df_residual)) |>
+    scale(center = TRUE, scale = FALSE)
+
+  message(sprintf("IRF confidence intervals: launching %d draws on %d workers ...",
+                  n_boot, workers))
+
+  irf_list <- seq_len(n_boot) |>
+    parallel::mclapply(FUN = function(b) {
+    # A common sign within year preserves contemporaneous cross-country dependence.
+    year_sign <- sample(c(-1, 1), length(all_years), replace = TRUE)
+    signs <- year_sign[match(year, all_years)]
+    innovations_b <- res_for_boot * signs
+
+    sim <- beta_bc |>
+      simulate_panel(innovations_b, X_lag, group,
+                     group_sizes, p, alpha = alpha_bc)
+
+    raw_fit <- sim$Y |>
+      fit_fe_var(sim$X, group, n_group)
+    beta_b_bc <- raw_fit$beta - estimated_bias
+
+    # Matlab corrects lag coefficients but retains this draw's uncorrected fixed effects.
+    residuals_b <- sim$Y - sim$X %*% beta_b_bc -
+      raw_fit$alpha[group, , drop = FALSE]
+    Sigma_b <- crossprod(residuals_b) / df_residual
+
+    beta_b_bc |>
+      cholesky_irf(Sigma_b, p, horizon)
+  }, mc.cores = workers, mc.preschedule = TRUE, mc.set.seed = TRUE)
+
+  irf_draws <- irf_list |>
+    unlist(use.names = FALSE) |>
+    array(dim = c(horizon + 1L, n_y, n_y, n_boot))
+  message("IRF confidence-interval bootstrap completed.")
+
+  list(lower = irf_draws |>
+         apply(c(1, 2, 3), quantile, probs = 0.025, names = FALSE),
+       upper = irf_draws |>
+         apply(c(1, 2, 3), quantile, probs = 0.975, names = FALSE),
+       n_boot = n_boot)
+}
+```
+
+## 3. Read the authors' prepared VAR data
+
+```{r data}
+stopifnot(file.exists(input_file))
+
+csv_in_zip <- paste0("MSV_ReplicationKit_20170307/Matlab/",
+                     "VAR3_levels_fixedeffects_IVprctiles.csv")
+
+# Both branches produce the same table, so downstream code is unchanged.
+file_type <- input_file |>
+  tools::file_ext() |>
+  tolower()
+if (file_type == "zip") {
+  raw <- unz(input_file, csv_in_zip) |>
+    read.csv(header = FALSE) |>
+    as_tibble()
+} else if (file_type == "csv") {
+  raw <- input_file |>
+    read.csv(header = FALSE) |>
+    as_tibble()
+} else {
+  stop("input_file must point to the replication ZIP or VAR3_levels_fixedeffects_IVprctiles.csv.")
+}
+
+# Column positions are defined by the authors' headerless Matlab input.
+country_id <- raw |>
+  pull(V1)
+year <- raw |>
+  pull(V2)
+Y <- raw |>
+  select(V7:V9) |>
+  as.matrix()
+X_lag <- raw |>
+  select(V10:V24) |>
+  as.matrix()
+
+colnames(Y) <- c("Household debt", "Firm debt", "Real GDP")
+
+p <- 5L
+horizon <- 10L
+country_levels <- country_id |>
+  unique()
+group <- country_id |>
+  match(country_levels)
+group_sizes <- group |>
+  tabulate(nbins = length(country_levels))
+n_country <- country_levels |>
+  length()
+n_y <- Y |>
+  ncol()
+T_obs <- Y |>
+  nrow()
+
+n_parameters <- n_y * p + n_country
+df_residual <- T_obs - n_parameters
+
+stopifnot(n_country == 30L, ncol(X_lag) == n_y * p)
+c(observations = T_obs, countries = n_country,
+  first_year = min(year), last_year = max(year), workers = workers)
+```
+
+## 4. Estimate and bias-correct the panel VAR
+
+```{r estimation}
+fit_ols <- Y |>
+  fit_fe_var(X_lag, group, n_country)
+
+bias_result <- Y |>
+  estimate_bias_corrected_beta(
+  X_lag = X_lag, fit_ols = fit_ols,
+  group = group, group_sizes = group_sizes, p = p,
+  n_boot = n_boot_bias, tol = bias_tol,
+  update_step = bias_step, max_iter = max_bias_iterations,
+  workers = workers
+)
+
+beta_bc <- bias_result$beta
+
+unexplained_bc <- Y - X_lag %*% beta_bc
+alpha_bc <- unexplained_bc |>
+  rowsum(group, reorder = FALSE) |>
+  sweep(1, group_sizes, "/")
+residuals_bc <- unexplained_bc - alpha_bc[group, , drop = FALSE]
+Sigma_bc <- crossprod(residuals_bc) / df_residual
+
+irf_point <- beta_bc |>
+  cholesky_irf(Sigma_bc, p, horizon)
+```
+
+## 5. Construct 95% confidence intervals
+
+```{r bootstrap-ci}
+if (!exists("bias_result") ||
+    is.null(bias_result$n_boot) ||
+    bias_result$n_boot != n_boot_bias ||
+    bias_result$convergence > bias_tol) {
+  stop("Run all chunks: bias_result is stale, incomplete, or not converged.")
+}
+
+irf_ci <- Y |>
+  bootstrap_irf_ci(
+  X_lag = X_lag, year = year,
+  group = group, group_sizes = group_sizes, p = p,
+  beta_bc = beta_bc, alpha_bc = alpha_bc,
+  residuals_bc = residuals_bc,
+  estimated_bias = bias_result$bias,
+  n_boot = n_boot_ci, horizon = horizon,
+  df_residual = df_residual, workers = workers
+)
+```
+
+## 6. Figure I
+
+```{r figure-1, fig.cap="Impulse Responses from a Recursive VAR in Real GDP, Nonfinancial Firm Debt, and Household Debt"}
+if (!exists("irf_ci") ||
+    is.null(irf_ci$n_boot) ||
+    irf_ci$n_boot != n_boot_ci) {
+  stop("Run all chunks: irf_ci is stale or incomplete.")
+}
+
+h <- 0:horizon
+
+old_par <- par(mfrow = c(1, 3), mar = c(4.1, 4.0, 2.8, 1.0),
+               oma = c(0, 0, 0, 0), family = "serif",
+               mgp = c(2.25, 0.7, 0), tcl = -0.25)
+
+draw_panel <- function(response, shock, title, ylim,
+                       xlab = "", show_legend = FALSE) {
+  plot(h, irf_point[, response, shock], type = "o",
+       pch = 16, cex = 0.55, lwd = 1.2,
+       xlim = c(0, 10), ylim = ylim, xaxt = "n",
+       xlab = xlab, ylab = "", main = title)
+  axis(1, at = seq(0, 10, 2))
+  lines(h, irf_ci$lower[, response, shock], lty = 2, lwd = 1.1)
+  lines(h, irf_ci$upper[, response, shock], lty = 2, lwd = 1.1)
+
+  if (show_legend) {
+    legend("bottomleft", c("Impulse response", "95% CI"),
+           lty = c(1, 2), pch = c(16, NA),
+           pt.cex = 0.55, lwd = 1.1, bty = "o", cex = 0.75)
+  }
+}
+
+# IRF array order is [horizon, response, shock].
+draw_panel(response = 1, shock = 1,
+           title = expression(d^{HH} %->% d^{HH}),
+           ylim = c(-0.2, 1.8), show_legend = TRUE)
+
+draw_panel(response = 3, shock = 1,
+           title = expression(d^{HH} %->% y),
+           ylim = c(-0.8, 0.6), xlab = "Years after impulse")
+
+draw_panel(response = 3, shock = 2,
+           title = expression(d^{F} %->% y),
+           ylim = c(-0.5, 0.4))
+
+par(old_par)
+```
