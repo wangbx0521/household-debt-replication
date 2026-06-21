@@ -14,11 +14,6 @@ library(ggplot2)
 library(patchwork)
 library(readr)
 
-knitr::opts_chunk$set(
-  echo = TRUE, warning = FALSE, message = TRUE,
-  fig.width = 12, fig.height = 4.2, dpi = 150
-)
-
 # The paper uses 2,000 draws in both stages.
 n_boot_bias <- 2000L
 n_boot_ci <- 2000L
@@ -386,7 +381,7 @@ irf_ci <- y_matrix |>
 
 ## 6. Figure I
 
-```{r figure-1, fig.cap="Impulse Responses from a Recursive VAR in Real GDP, Nonfinancial Firm Debt, and Household Debt"}
+```{r figure-1, fig.width=12, fig.height=4.2, dpi=150}
 make_panel_data <- function(response, shock) {
   tibble(
     year_after_impulse = 0:horizon,

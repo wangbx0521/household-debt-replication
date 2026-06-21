@@ -1,0 +1,201 @@
+---
+title: "Replication of Mian, Sufi and Verner (2017), Table III"
+output: html_document
+---
+
+## Setup
+
+```{r setup, message=FALSE}
+library(tidyverse)
+library(haven)
+library(fixest)
+library(car)
+library(modelsummary)
+```
+
+## Data
+
+```{r data}
+msv <- read_dta("PASTE_FILE_PATH_HERE")
+
+msv <- msv |>
+  arrange(.data$CountryCode, .data$year) |>
+  group_by(.data$CountryCode) |>
+  mutate(
+    ca_l1 = if_else(
+      .data$year - lag(.data$year) == 1,
+      lag(.data$CA_USD),
+      NA_real_
+    ),
+    ca_l2 = if_else(
+      .data$year - lag(.data$year, 2) == 2,
+      lag(.data$CA_USD, 2),
+      NA_real_
+    ),
+    ca_l3 = if_else(
+      .data$year - lag(.data$year, 3) == 3,
+      lag(.data$CA_USD, 3),
+      NA_real_
+    ),
+    ca_sum = .data$ca_l1 + .data$ca_l2 + .data$ca_l3,
+    net_foreign_debt_positive = if_else(
+      is.na(.data$ca_sum),
+      NA_real_,
+      as.numeric(.data$ca_sum < 0)
+    ),
+    household_debt_interaction =
+      .data$net_foreign_debt_positive * .data$L1D3HHD_GDP
+  ) |>
+  ungroup()
+
+main_sample <- msv |>
+  filter(.data$mainsmp1 == 1)
+
+common_sample <- main_sample |>
+  filter(!is.na(.data$L1D3NFD_GDP))
+```
+
+## Regressions
+
+```{r regressions}
+# These settings reproduce the covariance matrix reported by xtivreg2.
+stata_ssc <- ssc(
+  K.adj = FALSE,
+  G.adj = FALSE,
+  t.df = "conventional"
+)
+
+fit_table_3 <- function(formula, data) {
+  feols(
+    formula,
+    data = data,
+    vcov = ~CountryCode + year,
+    ssc = stata_ssc,
+    notes = FALSE
+  )
+}
+
+models <- list(
+  "(1)" = fit_table_3(
+    lnGDP_Fd3 ~ L1D3PD_GDP | CountryCode,
+    common_sample
+  ),
+  "(2)" = fit_table_3(
+    lnGDP_Fd3 ~ L1D3HHD_GDP | CountryCode,
+    common_sample
+  ),
+  "(3)" = fit_table_3(
+    lnGDP_Fd3 ~ L1D3NFD_GDP | CountryCode,
+    common_sample
+  ),
+  "(4)" = fit_table_3(
+    lnGDP_Fd3 ~ L1D3HHD_GDP + L1D3NFD_GDP | CountryCode,
+    main_sample
+  ),
+  "(5)" = fit_table_3(
+    lnGDP_Fd3 ~ L1lnGDP_d1 + L2lnGDP_d1 + L3lnGDP_d1 +
+      L1D3HHD_GDP + L1D3NFD_GDP | CountryCode,
+    main_sample
+  ),
+  "(6)" = fit_table_3(
+    lnGDP_Fd3 ~ L1lnGDP_d1 + L2lnGDP_d1 + L3lnGDP_d1 +
+      L1D3HHD_GDP + L1D3NFD_GDP + L1D3GD_GDP_Sol2 |
+      CountryCode,
+    main_sample
+  ),
+  "(7)" = fit_table_3(
+    lnGDP_Fd3 ~ L1lnGDP_d1 + L2lnGDP_d1 + L3lnGDP_d1 +
+      L1D3HHD_GDP + L1D3NFD_GDP + L1D3NFL_GDP | CountryCode,
+    main_sample
+  ),
+  "(8)" = fit_table_3(
+    lnGDP_Fd3 ~ L1lnGDP_d1 + L2lnGDP_d1 + L3lnGDP_d1 +
+      L1D3HHD_GDP + L1D3NFD_GDP + net_foreign_debt_positive +
+      household_debt_interaction | CountryCode,
+    main_sample
+  )
+)
+
+sample_sizes <- models |>
+  map_int(nobs)
+
+stopifnot(
+  identical(
+    unname(sample_sizes),
+    c(695L, 695L, 695L, 695L, 695L, 627L, 636L, 636L)
+  )
+)
+```
+
+## Table III
+
+```{r table-3}
+equality_test <- function(model) {
+  test <- linearHypothesis(
+    model,
+    "L1D3HHD_GDP = L1D3NFD_GDP",
+    test = "Chisq"
+  )
+
+  test[2, "Pr(>Chisq)"]
+}
+
+equality_p_values <- models[4:7] |>
+  map_dbl(equality_test) |>
+  sprintf(fmt = "%.3f")
+
+within_r_squared <- models |>
+  map_dbl(\(model) fitstat(model, "wr2")[[1]]) |>
+  signif(3) |>
+  as.character()
+
+extra_rows <- tribble(
+  ~term, ~"(1)", ~"(2)", ~"(3)", ~"(4)", ~"(5)", ~"(6)", ~"(7)", ~"(8)",
+  "Country fixed effects",
+  "✓", "✓", "✓", "✓", "✓", "✓", "✓", "✓",
+  "Distributed lag in Δy",
+  "", "", "", "", "✓", "✓", "✓", "✓",
+  "Test for equality of βHH and βF, p-value",
+  "", "", "", equality_p_values[1], equality_p_values[2],
+  equality_p_values[3], equality_p_values[4], "",
+  "Within R-squared",
+  within_r_squared[1], within_r_squared[2], within_r_squared[3],
+  within_r_squared[4], within_r_squared[5], within_r_squared[6],
+  within_r_squared[7], within_r_squared[8],
+  "Observations",
+  as.character(sample_sizes[1]), as.character(sample_sizes[2]),
+  as.character(sample_sizes[3]), as.character(sample_sizes[4]),
+  as.character(sample_sizes[5]), as.character(sample_sizes[6]),
+  as.character(sample_sizes[7]), as.character(sample_sizes[8])
+)
+
+coefficient_labels <- c(
+  "L1D3PD_GDP" = "Δ3 private debt",
+  "L1D3HHD_GDP" = "Δ3 household debt",
+  "L1D3NFD_GDP" = "Δ3 firm debt",
+  "L1D3GD_GDP_Sol2" = "Δ3 government debt",
+  "L1D3NFL_GDP" = "Δ3 net foreign debt",
+  "net_foreign_debt_positive" = "1(Δ3 net foreign debt > 0)",
+  "household_debt_interaction" =
+    "Δ3 household debt × 1(Δ3 net foreign debt > 0)"
+)
+
+modelsummary(
+  models,
+  coef_map = coefficient_labels,
+  statistic = "({std.error})",
+  fmt = fmt_significant(3),
+  stars = c("+" = 0.10, "*" = 0.05, "**" = 0.01),
+  gof_omit = ".*",
+  add_rows = extra_rows,
+  title = paste(
+    "Table III. Household Debt Expansion Predicts Lower Subsequent Growth",
+    "Dependent variable: Δ3 y(t+3)",
+    sep = "<br>"
+  ),
+  notes = paste(
+    "Country fixed effects are included in all specifications.",
+    "Standard errors are clustered by country and year."
+  )
+)
+```
